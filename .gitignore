@@ -1,0 +1,35 @@
+# Visual Studio
+.vs/
+*.vcxproj.user
+*.suo
+*.user
+*.opensdf
+*.sdf
+*.db
+*.VC.db
+*.cache
+
+# CMake
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+out/
+build/
+
+# Compiled binaries
+*.exe
+*.dll
+*.pdb
+*.ilk
+*.lib
+*.obj
+
+# Temporary
+*.ipch
+*.log
+*.tmp
+
+# Ninja
+.ninja_log
+.ninja_deps
