@@ -7,6 +7,7 @@
 #include "tt.hpp"
 #include "zobrist.hpp"
 #include "moveorderer.hpp"
+#include <omp.h>
 
 #define min(a, b) ((a) < (b) ? (a) : (b))
 #define max(a, b) ((a) > (b) ? (a) : (b))
@@ -20,13 +21,54 @@ int _DEPTH;
 
 int search(Board board, int depth) {
     // Reset previous search results
-    SEARCH_BEST_MOVE = Move{}; // value-initialize
+    SEARCH_BEST_MOVE = Move{};
     SEARCH_NODES_SEARCHED = 0;
     _DEPTH = depth;
 
-    int eval = alphabeta(board, depth, MIN_EVAL, MAX_EVAL);
-    return eval;
+    // --- Generate root moves ---
+    Move rootMoves[256]{};
+    int cmoves = legalMoves(&board, rootMoves);
+    score_moves(board, getTTEntry(board.hash), rootMoves, cmoves);
+
+    int globalBestScore = MIN_EVAL;
+    Move globalBestMove{};
+
+    // Parallelize only the root layer
+    #pragma omp parallel
+    {
+        int localBestScore = MIN_EVAL;
+        Move localBestMove{};
+
+        #pragma omp for schedule(dynamic)
+        for (int i = 0; i < cmoves; i++) {
+            if (rootMoves[i].validation != LEGAL) continue;
+
+            Board child = board;
+            pushMove(&child, rootMoves[i]);
+
+            int score = -alphabeta(child, depth - 1, MIN_EVAL, MAX_EVAL);
+
+            if (score > localBestScore) {
+                localBestScore = score;
+                localBestMove = rootMoves[i];
+            }
+        }
+
+        // Merge thread-local results into global best
+        #pragma omp critical
+        {
+            if (localBestScore > globalBestScore) {
+                globalBestScore = localBestScore;
+                globalBestMove = localBestMove;
+            }
+        }
+    }
+
+    // Store for caller
+    SEARCH_BEST_MOVE = globalBestMove;
+    return globalBestScore;
 }
+
 
 int alphabeta(Board board, int depth, int alpha, int beta) {
     SEARCH_NODES_SEARCHED++;

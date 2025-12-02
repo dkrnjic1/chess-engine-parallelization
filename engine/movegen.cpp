@@ -5,6 +5,8 @@
 #include "movegen.hpp"
 #include "board.hpp"
 #include "utils.hpp"
+#include <omp.h>
+
 
 #define getMove(from, to, promo, castling, pType) Move{from, to, promo, castling, pType}
 #define addMove moves[length] = move; length++;
@@ -386,6 +388,153 @@ bool isSquareAttacked(const Board& board, int square) {
     return false;
 }
 
+
+/* 
+int legalMoves(Board* board, Move moves[]) {
+    int length = 0;
+
+    int kingSquare = board->turn ? board->whiteKingSq : board->blackKingSq;
+    Bitboard friendlyOccupancy = board->turn ? board->occupancyWhite : board->occupancyBlack;
+    Bitboard bishopBitboard = board->turn ? board->bishop_W : board->bishop_B;
+    Bitboard rookBitboard = board->turn ? board->rook_W : board->rook_B;
+    Bitboard queenBitboard = board->turn ? board->queen_W : board->queen_B;
+    Bitboard knightBitboard = board->turn ? board->knight_W : board->knight_B;
+    Bitboard pawnMask = board->turn ? board->pawn_W : board->pawn_B;
+
+    Bitboard attackMask = 0;
+
+    // Generate pawn pushes
+    Bitboard singlePush, doublePush;
+    pawnSingleAndDblPushes(*board, &singlePush, &doublePush);
+
+    // En-passant
+    Bitboard epSquare = (board->epSquare == -1) ? 0ULL : SQUARE_BITBOARDS[board->epSquare];
+    Bitboard occForCaptures = epSquare | (board->turn ? board->occupancyBlack : board->occupancyWhite);
+
+    // Thread-local storage for moves
+    const int MAX_THREADS = 64;
+    Move threadMoves[MAX_THREADS][256];
+    int threadLengths[MAX_THREADS] = { 0 };
+
+    #pragma omp parallel
+    {
+        int tid = omp_get_thread_num();
+        Move* localMoves = threadMoves[tid];
+        int& localLength = threadLengths[tid];
+
+        // ======================
+        //   PAWN CAPTURES
+        // ======================
+        Bitboard localPawnMask = pawnMask;
+        while (localPawnMask) {
+            int sq = countTrailingZeros(localPawnMask);
+            bool isPromoting = board->turn ? (SQUARE_BITBOARDS[sq] & RANK_7) : (SQUARE_BITBOARDS[sq] & RANK_1);
+
+            if (board->turn) {
+                Bitboard eastAttacks = PAWN_W_ATTACKS_EAST[sq] & occForCaptures;
+                Bitboard westAttacks = PAWN_W_ATTACKS_WEST[sq] & occForCaptures;
+
+                if (eastAttacks) addPawnAdvanceWithPossiblePromos(*board, isPromoting, board->turn, sq, sq + 7, localMoves, &localLength);
+                if (westAttacks) addPawnAdvanceWithPossiblePromos(*board, isPromoting, board->turn, sq, sq + 9, localMoves, &localLength);
+            }
+            else {
+                Bitboard eastAttacks = PAWN_B_ATTACKS_EAST[sq] & occForCaptures;
+                Bitboard westAttacks = PAWN_B_ATTACKS_WEST[sq] & occForCaptures;
+
+                if (eastAttacks) addPawnAdvanceWithPossiblePromos(*board, isPromoting, board->turn, sq, sq - 7, localMoves, &localLength);
+                if (westAttacks) addPawnAdvanceWithPossiblePromos(*board, isPromoting, board->turn, sq, sq - 9, localMoves, &localLength);
+            }
+
+            localPawnMask &= localPawnMask - 1;
+        }
+
+        // ======================
+        //   SINGLE & DOUBLE PUSHES
+        // ======================
+        Bitboard localSinglePush = singlePush;
+        while (localSinglePush) {
+            int sq = countTrailingZeros(localSinglePush);
+            int fromSquare = board->turn ? (sq - 8) : (sq + 8);
+            bool isPromoting = board->turn ? (fromSquare >= H7 && fromSquare <= A7) : (fromSquare >= H2 && fromSquare <= A2);
+            addPawnAdvanceWithPossiblePromos(*board, isPromoting, board->turn, fromSquare, sq, localMoves, &localLength);
+            localSinglePush &= localSinglePush - 1;
+        }
+
+        Bitboard localDoublePush = doublePush;
+        int pawnPieceType = board->turn ? PAWN_W : PAWN_B;
+        while (localDoublePush) {
+            int sq = countTrailingZeros(localDoublePush);
+            int fromSquare = board->turn ? (sq - 16) : (sq + 16);
+            Move move = getMove(fromSquare, sq, NO_PROMOTION, NOT_CASTLE, pawnPieceType);
+            validateMove(*board, &move);
+            if (move.validation == LEGAL) localMoves[localLength++] = move;
+            localDoublePush &= localDoublePush - 1;
+        }
+
+        // ======================
+        //   KING MOVES
+        // ======================
+        Bitboard localKingMoves = getKingMask(*board);
+        while (localKingMoves) {
+            int sq = countTrailingZeros(localKingMoves);
+            Move move = getMove(kingSquare, sq, NO_PROMOTION, NOT_CASTLE, board->turn ? KING_W : KING_B);
+            validateMove(*board, &move);
+            if (move.validation == LEGAL) localMoves[localLength++] = move;
+            localKingMoves &= localKingMoves - 1;
+        }
+
+        // ======================
+        //   SLIDING & KNIGHT MOVES
+        // ======================
+        struct PieceData { Bitboard bb; int pieceType; Bitboard(*attacks)(int, Bitboard); };
+        PieceData pieces[5] = {
+            {bishopBitboard, board->turn ? BISHOP_W : BISHOP_B, getBishopAttacks},
+            {rookBitboard, board->turn ? ROOK_W : ROOK_B, getRookAttacks},
+            {queenBitboard, board->turn ? QUEEN_W : QUEEN_B, nullptr}, // handle queen separately
+            {knightBitboard, board->turn ? KNIGHT_W : KNIGHT_B, nullptr}
+        };
+
+        // Loop over bishops, rooks, queens, knights
+        for (int p = 0; p < 4; p++) {
+            Bitboard bb = pieces[p].bb;
+            while (bb) {
+                int sq = countTrailingZeros(bb);
+                Bitboard attacks;
+                if (p == 2) { // queen
+                    attacks = getBishopAttacks(sq, board->occupancy) | getRookAttacks(sq, board->occupancy);
+                }
+                else if (p == 3) { // knight
+                    attacks = KNIGHT_MOVEMENT[sq];
+                }
+                else {
+                    attacks = pieces[p].attacks(sq, board->occupancy);
+                }
+                attacks &= ~friendlyOccupancy;
+                while (attacks) {
+                    int to = countTrailingZeros(attacks);
+                    Move move = getMove(sq, to, NO_PROMOTION, NOT_CASTLE, pieces[p].pieceType);
+                    validateMove(*board, &move);
+                    if (move.validation == LEGAL) localMoves[localLength++] = move;
+                    attacks &= attacks - 1;
+                }
+                bb &= bb - 1;
+            }
+        }
+    } // end parallel region
+
+    // Merge all thread-local moves into main array
+    for (int t = 0; t < omp_get_max_threads(); t++) {
+        for (int i = 0; i < threadLengths[t]; i++) {
+            moves[length++] = threadMoves[t][i];
+        }
+    }
+
+    board->attacks = attackMask;
+    return length;
+}
+*/
+
+
 int legalMoves(Board* board, Move moves[]) {
     int length = 0;
 
@@ -650,5 +799,5 @@ int legalMoves(Board* board, Move moves[]) {
 
     board->attacks = attackMask;
     return length;
-}
+} 
 
